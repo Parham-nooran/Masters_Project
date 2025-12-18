@@ -136,6 +136,11 @@ def _update_agent_parameters(agent):
     agent.update_epsilon(decay_rate=0.995, min_epsilon=0.01)
 
 
+def _initialize_device():
+    """Initialize computation device."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 class DecQNTrainer(Logger):
     """Trainer for Decoupled Q-Networks Agent."""
 
@@ -143,16 +148,12 @@ class DecQNTrainer(Logger):
         super().__init__(working_dir + "/logs")
         self.working_dir = working_dir
         self.config = config
-        self.device = self._initialize_device()
+        self.device = _initialize_device()
         self.agent_name = "deqn"
 
         self.checkpoint_manager = self._create_checkpoint_manager()
         self.env = self._create_environment()
         self.agent = self._create_agent()
-
-    def _initialize_device(self):
-        """Initialize computation device."""
-        return "cuda" if torch.cuda.is_available() else "cpu"
 
     def _create_checkpoint_manager(self):
         """Create checkpoint manager."""
