@@ -2,7 +2,7 @@ import torch
 from collections import deque
 
 
-class CQNActionSpaceManager:
+class GCQNActionSpaceManager:
     """
     Manages growing action space with adaptive unmasking.
     Combines GQN's preservation through masking with CQN's coarse-to-fine philosophy.
@@ -253,6 +253,124 @@ class CQNActionSpaceManager:
             "growth_events": len(self.growth_history)
         }
 
+    def get_visual_representation(self, logger=None):
+        """
+        Generate visual representation of active bins per dimension.
+        Returns both ASCII art and detailed breakdown.
+        """
+        visualization = []
+
+        for dim in range(self.action_dim):
+            active_indices = torch.where(self.active_masks[dim])[0].cpu().numpy()
+
+            dim_viz = self._create_dimension_visualization(dim, active_indices)
+            visualization.append(dim_viz)
+
+            if logger:
+                logger.info(f"  Dim {dim}: {dim_viz['ascii']}")
+                logger.info(f"         Active bins: {dim_viz['active_bins']}/{self.final_bins} "
+                            f"| Range: [{dim_viz['min_val']:.2f}, {dim_viz['max_val']:.2f}]")
+
+        return visualization
+
+    def _create_dimension_visualization(self, dim, active_indices):
+        """Create visualization for single dimension."""
+        ascii_repr = []
+
+        for bin_idx in range(self.final_bins):
+            if bin_idx in active_indices:
+                ascii_repr.append("█")
+            else:
+                ascii_repr.append("░")
+
+        active_bins_values = self.action_bins[dim, active_indices].cpu().numpy()
+
+        return {
+            "dimension": dim,
+            "ascii": "".join(ascii_repr),
+            "active_bins": len(active_indices),
+            "min_val": active_bins_values.min() if len(active_bins_values) > 0 else 0,
+            "max_val": active_bins_values.max() if len(active_bins_values) > 0 else 0,
+            "active_indices": active_indices.tolist()
+        }
+
+    def get_growth_focus_visualization(self, metrics, logger=None):
+        """
+        Visualize which bins are likely to be unmasked next.
+        Shows high-priority bins with special markers.
+        """
+        if not hasattr(self.metrics_tracker, 'q_history') or len(self.metrics_tracker.q_history) < 10:
+            return None
+
+        visualization = []
+
+        variance_norm = self._normalize_metric(metrics["q_variance"])
+        advantage_norm = self._normalize_metric(metrics["q_advantage"])
+        hybrid_score = 0.4 * variance_norm + 0.4 * advantage_norm + 0.2 * self._normalize_metric(
+            metrics["visit_counts"])
+
+        threshold = torch.quantile(hybrid_score[self.active_masks], 0.75) if self.active_masks.any() else 0
+
+        for dim in range(self.action_dim):
+            dim_viz = self._create_focus_visualization(
+                dim, hybrid_score[dim], threshold
+            )
+            visualization.append(dim_viz)
+
+            if logger:
+                logger.info(f"  Dim {dim}: {dim_viz['ascii']}")
+                logger.info(f"         Focus score: {dim_viz['focus_score']:.3f} | "
+                            f"High-priority bins: {dim_viz['high_priority_count']}")
+
+        return visualization
+
+    def _create_focus_visualization(self, dim, scores, threshold):
+        """Create focus visualization for single dimension."""
+        ascii_repr = []
+        high_priority_count = 0
+
+        for bin_idx in range(self.final_bins):
+            if self.active_masks[dim, bin_idx]:
+                if scores[bin_idx] > threshold:
+                    ascii_repr.append("▓")
+                    high_priority_count += 1
+                else:
+                    ascii_repr.append("█")
+            else:
+                ascii_repr.append("░")
+
+        return {
+            "dimension": dim,
+            "ascii": "".join(ascii_repr),
+            "focus_score": scores[self.active_masks[dim]].mean().item() if self.active_masks[dim].any() else 0,
+            "high_priority_count": high_priority_count,
+            "threshold": threshold.item()
+        }
+
+    def log_detailed_growth_state(self, logger, episode):
+        """Log comprehensive growth state information."""
+        logger.info("=" * 80)
+        logger.info(f"ACTION SPACE STATE at Episode {episode}")
+        logger.info("=" * 80)
+
+        growth_info = self.get_growth_info()
+        logger.info(f"Overall: {growth_info['total_active_bins']}/{growth_info['total_possible_bins']} bins active "
+                    f"({100 * growth_info['total_active_bins'] / growth_info['total_possible_bins']:.1f}%)")
+        logger.info(f"Growth events: {growth_info['growth_events']}")
+        logger.info("")
+
+        logger.info("Active Bins per Dimension:")
+        logger.info("Legend: █ = Active  ░ = Masked  ▓ = High Priority for Unmasking")
+        self.get_visual_representation(logger)
+        logger.info("")
+
+        if len(self.metrics_tracker.q_history) >= 10:
+            metrics = self.metrics_tracker.compute_metrics()
+            logger.info("Growth Focus (bins likely to unmask next):")
+            self.get_growth_focus_visualization(metrics, logger)
+
+        logger.info("=" * 80)
+
 
 class UnmaskingMetricsTracker:
     """Tracks metrics for adaptive unmasking decisions."""
@@ -304,14 +422,15 @@ class UnmaskingMetricsTracker:
 
     def _compute_advantage(self, stacked_q):
         """Compute advantage of each bin relative to mean."""
-        q_mean = stacked_q.mean(dim=[0, 2])
         recent_q = stacked_q[-10:].mean(dim=0)
 
         advantages = torch.zeros(
             self.action_dim, self.num_bins, device=self.device
         )
+
         for dim in range(self.action_dim):
-            advantages[dim] = recent_q[dim] - q_mean[dim]
+            dim_q_mean = recent_q[:, dim, :].mean()
+            advantages[dim] = recent_q[:, dim, :].mean(dim=0) - dim_q_mean
 
         return advantages
 

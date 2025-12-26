@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from src.gcqn.action_space_manager import CQNActionSpaceManager
+from src.gcqn.action_space_manager import GCQNActionSpaceManager
 from src.common.replay_buffer import PrioritizedReplayBuffer
 from src.common.encoder import VisionEncoder
 from src.gqn.network import DualDecoupledQNetwork
@@ -56,7 +56,7 @@ class GCQNAgent:
 
     def _create_action_space_manager(self, config, action_spec):
         """Create hybrid action space manager."""
-        return CQNActionSpaceManager(
+        return GCQNActionSpaceManager(
             action_spec, config.initial_bins, config.final_bins, self.device
         )
 

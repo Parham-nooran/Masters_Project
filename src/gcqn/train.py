@@ -1,9 +1,6 @@
 import gc
 import time
 import torch
-import sys
-
-sys.path.append("src")
 from src.common.checkpoint_manager import CheckpointManager
 from src.common.logger import Logger
 from src.common.metrics_accumulator import MetricsAccumulator
@@ -56,7 +53,7 @@ def update_metrics_accumulator(metrics, metrics_accumulator):
     metrics_accumulator.update(metrics)
 
 
-class HybridTrainer(Logger):
+class GCQNTrainer(Logger):
     """Trainer for Hybrid CQN-GQN Agent."""
 
     def __init__(self, config, working_dir="./output/hybrid"):
@@ -296,6 +293,10 @@ class HybridTrainer(Logger):
         """Log episode metrics at specified intervals."""
         if episode % self.config.log_interval == 0:
             self._log_basic_metrics(episode, metrics)
+            if episode % 10 == 0:
+                self.agent.action_space_manager.log_detailed_growth_state(
+                    self.logger, episode
+                )
 
         if episode % self.config.detailed_log_interval == 0 and episode > 0:
             self._log_detailed_metrics(episode, start_time)
@@ -436,5 +437,5 @@ class HybridTrainer(Logger):
 if __name__ == "__main__":
     args = parse_hybrid_args()
     config = create_hybrid_config_from_args(args)
-    trainer = HybridTrainer(config)
+    trainer = GCQNTrainer(config)
     trained_agent = trainer.train()
