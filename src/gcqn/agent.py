@@ -3,10 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from action_space_manager import CQNActionSpaceManager
-import sys
-
-sys.path.append("src")
+from src.gcqn.action_space_manager import CQNActionSpaceManager
 from src.common.replay_buffer import PrioritizedReplayBuffer
 from src.common.encoder import VisionEncoder
 from src.gqn.network import DualDecoupledQNetwork

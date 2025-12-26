@@ -15,8 +15,8 @@ from src.common.training_utils import (
     init_training,
 )
 from src.plotting.plotting_utils import PlottingUtils
-from agent import GCQNAgent
-from config import parse_hybrid_args, create_hybrid_config_from_args
+from src.gcqn.agent import GCQNAgent
+from src.gcqn.config import parse_hybrid_args, create_hybrid_config_from_args
 
 
 def convert_action_to_numpy(action):
