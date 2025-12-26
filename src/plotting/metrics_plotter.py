@@ -214,7 +214,7 @@ class RewardPlotter:
                 mean_rewards,
                 color=color,
                 linewidth=2.5,
-                label=f"{algorithm} (n={len(seeds_data)})",
+                label=f"{algorithm}",
                 alpha=0.9,
             )
             ax.fill_between(
@@ -244,7 +244,7 @@ class RewardPlotter:
         print(f"  Saved: {filename}")
 
     def plot_smoothed_seed_averaged_comparison(
-        self, algorithms_data: Dict[str, List[Dict]], task: str, window: int = 100
+        self, algorithms_data: Dict[str, List[Dict]], task: str, window: int = 50
     ):
         """
         Plot 2: Seed-averaged + window-smoothed comparison.
@@ -279,7 +279,7 @@ class RewardPlotter:
                     smoothed_mean,
                     color=color,
                     linewidth=2.5,
-                    label=f"{algorithm} (n={len(seeds_data)})",
+                    label=f"{algorithm}",
                     alpha=0.9,
                 )
                 ax.fill_between(
@@ -350,7 +350,7 @@ def main():
     parser.add_argument(
         "--window",
         type=int,
-        default=100,
+        default=20,
         help="Window size for moving average smoothing",
     )
     parser.add_argument(
@@ -481,8 +481,8 @@ def main():
             print(f"\n  Generating success rate plots...")
             plotter.plot_success_rate(save=True)
 
-        # print(f"  Generating smoothed seed-averaged plot...")
-        # plotter.plot_smoothed_seed_averaged_comparison(algorithms_data, task, window=args.window)
+        print(f"  Generating smoothed seed-averaged plot...")
+        plotter.plot_smoothed_seed_averaged_comparison(algorithms_data, task, window=args.window)
 
     print("\n" + "=" * 70)
     print("Summary")
