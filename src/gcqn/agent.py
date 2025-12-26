@@ -20,8 +20,8 @@ def _compute_observation_dimension(config, obs_shape):
 
 class GCQNAgent:
     """
-    Hybrid CQN-GQN agent combining masking-based action space preservation
-    with coarse-to-fine adaptive refinement.
+    True Coarse-to-Fine Agent (GCQN).
+    Combines wide coverage → importance learning → selective pruning & refinement.
     """
 
     def __init__(self, config, obs_shape, action_spec):
@@ -55,7 +55,7 @@ class GCQNAgent:
         return optim.Adam(self.encoder.parameters(), lr=config.learning_rate)
 
     def _create_action_space_manager(self, config, action_spec):
-        """Create hybrid action space manager."""
+        """Create true coarse-to-fine action space manager."""
         return GCQNActionSpaceManager(
             action_spec, config.initial_bins, config.final_bins, self.device
         )
@@ -335,18 +335,17 @@ class GCQNAgent:
         if self.update_counter % self.config.target_update_period == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
-    def check_and_grow(self, episode, episode_return):
-        """Check conditions and grow action space if appropriate."""
-        if episode < self.config.min_episodes_before_growth:
-            return False
-
-        if episode % self.config.growth_check_interval != 0:
-            return False
-
-        grew = self.action_space_manager.check_and_unmask(
-            episode, self.config.unmasking_strategy
+    def check_and_adapt(self, episode, episode_return):
+        """
+        Check conditions and adapt action space if appropriate.
+        Returns tuple: (adapted, phase_changed)
+        """
+        adapted, phase_changed = self.action_space_manager.check_and_adapt(
+            episode,
+            self.config.min_episodes_phase2,
+            self.config.min_episodes_phase3
         )
-        return grew
+        return adapted, phase_changed
 
     def update_epsilon(self, decay_rate=None, min_epsilon=None):
         """Update exploration rate with decay."""
@@ -364,6 +363,8 @@ class GCQNAgent:
             "epsilon": self.epsilon,
             "action_space_masks": self.action_space_manager.active_masks,
             "growth_history": self.action_space_manager.growth_history,
+            "pruning_history": self.action_space_manager.pruning_history,
+            "current_phase": self.action_space_manager.current_phase,
         }
 
         if self.encoder:
@@ -381,6 +382,8 @@ class GCQNAgent:
         self.epsilon = checkpoint["epsilon"]
         self.action_space_manager.active_masks = checkpoint["action_space_masks"]
         self.action_space_manager.growth_history = checkpoint["growth_history"]
+        self.action_space_manager.pruning_history = checkpoint.get("pruning_history", [])
+        self.action_space_manager.current_phase = checkpoint.get("current_phase", 1)
 
         if "encoder" in checkpoint and self.encoder:
             self.encoder.load_state_dict(checkpoint["encoder"])
