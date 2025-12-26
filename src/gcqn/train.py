@@ -13,7 +13,7 @@ from src.common.training_utils import (
 )
 from src.plotting.plotting_utils import PlottingUtils
 from src.gcqn.agent import GCQNAgent
-from src.gcqn.config import parse_hybrid_args, create_hybrid_config_from_args
+from src.gcqn.config import parse_gcqn_args, create_gcqn_config_from_args
 
 
 def convert_action_to_numpy(action):
@@ -37,8 +37,10 @@ def create_episode_metrics_dict(episode_reward, steps, episode_time, averages, a
         "epsilon": agent.epsilon,
         "mse_loss": averages.get("mse_loss", 0.0),
         "episode_time": episode_time,
-        "current_bins": growth_info["total_active_bins"],
-        "growth_events": growth_info["growth_events"],
+        "current_phase": growth_info["current_phase"],
+        "active_bins": growth_info["total_active_bins"],
+        "refinement_events": growth_info["refinement_events"],
+        "pruning_events": growth_info["pruning_events"],
         "success": success,
     }
 
@@ -54,14 +56,14 @@ def update_metrics_accumulator(metrics, metrics_accumulator):
 
 
 class GCQNTrainer(Logger):
-    """Trainer for Hybrid CQN-GQN Agent."""
+    """Trainer for True Coarse-to-Fine GCQN Agent."""
 
-    def __init__(self, config, working_dir="./output/hybrid"):
+    def __init__(self, config, working_dir="./output/gcqn"):
         super().__init__(working_dir + "/logs")
         self.working_dir = working_dir
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.agent_name = "hybrid"
+        self.agent_name = "gcqn"
         self.checkpoint_manager = CheckpointManager(
             self.logger, checkpoint_dir=self.working_dir + "/checkpoints"
         )
@@ -100,11 +102,12 @@ class GCQNTrainer(Logger):
     def _log_setup_info(self, agent):
         """Log training setup information."""
         self._print_separator()
-        self.logger.info("Hybrid CQN-GQN Agent Setup:")
+        self.logger.info("True Coarse-to-Fine GCQN Agent Setup:")
         self._print_separator()
 
         self._log_environment_info()
         self._log_action_space_info(agent)
+        self._log_phase_transitions()
         self._log_learning_parameters()
         self._log_replay_buffer_info()
         self._log_regularization_info()
@@ -132,13 +135,18 @@ class GCQNTrainer(Logger):
     def _log_action_space_info(self, agent):
         """Log action space configuration."""
         self.logger.info(f"Action dimensions: {agent.action_space_manager.action_dim}")
-        self.logger.info(f"Initial bins: {self.config.initial_bins}")
-        self.logger.info(f"Final bins: {self.config.final_bins}")
-        self.logger.info(f"Unmasking strategy: {self.config.unmasking_strategy}")
-        self.logger.info(f"Growth check interval: {self.config.growth_check_interval}")
+        self.logger.info(f"Initial bins (wide coverage): {self.config.initial_bins}")
+        self.logger.info(f"Final bins (max resolution): {self.config.final_bins}")
+        self.logger.info(f"Algorithm: True Coarse-to-Fine")
+        self._print_subseparator()
+
+    def _log_phase_transitions(self):
+        """Log phase transition schedule."""
+        self.logger.info("Phase Transition Schedule:")
+        self.logger.info(f"  Phase 1 (Wide Coverage): Episodes 0-{self.config.min_episodes_phase2 - 1}")
         self.logger.info(
-            f"Min episodes before growth: {self.config.min_episodes_before_growth}"
-        )
+            f"  Phase 2 (Learning Importance): Episodes {self.config.min_episodes_phase2}-{self.config.min_episodes_phase3 - 1}")
+        self.logger.info(f"  Phase 3 (Pruning & Refinement): Episodes {self.config.min_episodes_phase3}+")
         self._print_subseparator()
 
     def _log_learning_parameters(self):
@@ -186,7 +194,7 @@ class GCQNTrainer(Logger):
             episode_metrics = self._run_episode(env, agent, metrics_accumulator)
 
             self._log_episode_metrics(episode, episode_metrics, start_time)
-            self._check_and_log_growth(episode, episode_metrics, agent)
+            self._check_and_log_adaptation(episode, episode_metrics, agent)
 
             agent.update_epsilon()
 
@@ -196,19 +204,45 @@ class GCQNTrainer(Logger):
 
             metrics_tracker.log_episode(episode=episode, **episode_metrics)
 
-    def _check_and_log_growth(self, episode, episode_metrics, agent):
-        """Check if action space grew and log if it did."""
-        grew = agent.check_and_grow(episode, episode_metrics["reward"])
-        if grew:
-            self._log_action_space_growth(episode, agent)
+    def _check_and_log_adaptation(self, episode, episode_metrics, agent):
+        """Check if action space adapted and log changes."""
+        adapted, phase_changed = agent.check_and_adapt(
+            episode, episode_metrics["reward"]
+        )
 
-    def _log_action_space_growth(self, episode, agent):
-        """Log action space growth event."""
+        if phase_changed:
+            self._log_phase_change(episode, agent)
+
+        if adapted:
+            self._log_action_space_adaptation(episode, agent)
+
+    def _log_phase_change(self, episode, agent):
+        """Log phase transition event."""
+        growth_info = agent.action_space_manager.get_growth_info()
+        phase_names = {
+            1: "Wide Coverage",
+            2: "Learning Importance",
+            3: "Pruning & Refinement"
+        }
+        current_phase_name = phase_names.get(growth_info["current_phase"], "Unknown")
+
+        self.logger.info("")
+        self.logger.info("🔄" * 40)
+        self.logger.info(
+            f">>> PHASE TRANSITION at episode {episode} | "
+            f"Entering Phase {growth_info['current_phase']}: {current_phase_name}"
+        )
+        self.logger.info("🔄" * 40)
+        self.logger.info("")
+
+    def _log_action_space_adaptation(self, episode, agent):
+        """Log action space adaptation event."""
         growth_info = agent.action_space_manager.get_growth_info()
         self.logger.info(
-            f">>> ACTION SPACE GREW at episode {episode} | "
+            f">>> ACTION SPACE ADAPTED at episode {episode} | "
             f"Active bins: {growth_info['total_active_bins']}/{growth_info['total_possible_bins']} | "
-            f"Growth events: {growth_info['growth_events']}"
+            f"Refinements: {growth_info['refinement_events']} | "
+            f"Prunings: {growth_info['pruning_events']}"
         )
         self.logger.info(f"    Per-dimension active: {growth_info['active_per_dimension']}")
 
@@ -293,20 +327,24 @@ class GCQNTrainer(Logger):
         """Log episode metrics at specified intervals."""
         if episode % self.config.log_interval == 0:
             self._log_basic_metrics(episode, metrics)
-            if episode % 10 == 0:
-                self.agent.action_space_manager.log_detailed_growth_state(
-                    self.logger, episode
-                )
 
         if episode % self.config.detailed_log_interval == 0 and episode > 0:
             self._log_detailed_metrics(episode, start_time)
+            if episode % 10 == 0:
+                self.agent.action_space_manager.log_detailed_state(
+                    self.logger, episode
+                )
 
     def _log_basic_metrics(self, episode, metrics):
         """Log basic episode metrics."""
         buffer_size = len(self.agent.replay_buffer) if hasattr(self, "agent") else 0
 
+        phase_names = {1: "P1-Wide", 2: "P2-Learn", 3: "P3-Adapt"}
+        phase_str = phase_names.get(metrics.get("current_phase", 1), "P?")
+
         log_msg = (
             f"Ep {episode:4d} | "
+            f"{phase_str} | "
             f"Steps {metrics['steps']:4d} | "
             f"R: {metrics['reward']:7.2f} | "
             f"Loss: {metrics['loss']:8.6f} | "
@@ -314,8 +352,9 @@ class GCQNTrainer(Logger):
             f"TD: {metrics['mean_abs_td_error']:8.6f} | "
             f"Q: {metrics['q_mean']:6.3f} | "
             f"ε: {metrics['epsilon']:.4f} | "
-            f"Active: {metrics.get('current_bins', 'N/A')} | "
-            f"Grows: {metrics.get('growth_events', 0)} | "
+            f"Bins: {metrics.get('active_bins', 'N/A'):2d} | "
+            f"Ref: {metrics.get('refinement_events', 0):2d} | "
+            f"Prune: {metrics.get('pruning_events', 0):2d} | "
             f"Time: {metrics['episode_time']:.2f}s | "
             f"Buf: {buffer_size:6d}"
             f" | Success: {metrics['success']}"
@@ -356,10 +395,17 @@ class GCQNTrainer(Logger):
             return
 
         growth_info = self.agent.action_space_manager.get_growth_info()
+        phase_names = {1: "Wide Coverage", 2: "Learning Importance", 3: "Pruning & Refinement"}
+
+        self.logger.info(
+            f"  Current phase: {growth_info['current_phase']} - "
+            f"{phase_names.get(growth_info['current_phase'], 'Unknown')}"
+        )
         self.logger.info(
             f"  Active bins: {growth_info['total_active_bins']}/{growth_info['total_possible_bins']}"
         )
-        self.logger.info(f"  Growth events: {growth_info['growth_events']}")
+        self.logger.info(f"  Refinement events: {growth_info['refinement_events']}")
+        self.logger.info(f"  Pruning events: {growth_info['pruning_events']}")
         self.logger.info(f"  Epsilon: {self.agent.epsilon:.4f}")
         self.logger.info(f"  Replay buffer size: {len(self.agent.replay_buffer)}")
 
@@ -435,7 +481,7 @@ class GCQNTrainer(Logger):
 
 
 if __name__ == "__main__":
-    args = parse_hybrid_args()
-    config = create_hybrid_config_from_args(args)
+    args = parse_gcqn_args()
+    config = create_gcqn_config_from_args(args)
     trainer = GCQNTrainer(config)
     trained_agent = trainer.train()

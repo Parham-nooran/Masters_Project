@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GCQNConfig:
-    """Configuration for Hybrid CQN-GQN with all hyperparameters."""
+    """Configuration for True Coarse-to-Fine GCQN with phase-based parameters."""
 
     env_type: str = "dmcontrol"
     task: str = "walker_walk"
@@ -22,11 +22,10 @@ class GCQNConfig:
     min_replay_size: int = 1000
     max_replay_size: int = 1000000
 
-    initial_bins: int = 2
+    initial_bins: int = 5
     final_bins: int = 9
-    unmasking_strategy: str = "hybrid"
-    growth_check_interval: int = 50
-    min_episodes_before_growth: int = 100
+    min_episodes_phase2: int = 50
+    min_episodes_phase3: int = 150
 
     epsilon: float = 0.1
     epsilon_decay: float = 0.995
@@ -54,7 +53,7 @@ class GCQNConfig:
     load_metrics: str = None
 
 
-def create_hybrid_config_from_args(args):
+def create_gcqn_config_from_args(args):
     """Create config from command line arguments."""
     config = GCQNConfig()
 
@@ -65,9 +64,9 @@ def create_hybrid_config_from_args(args):
     return config
 
 
-def parse_hybrid_args():
-    """Parse command line arguments for hybrid training."""
-    parser = argparse.ArgumentParser(description="Train Hybrid CQN-GQN")
+def parse_gcqn_args():
+    """Parse command line arguments for GCQN training."""
+    parser = argparse.ArgumentParser(description="Train True Coarse-to-Fine GCQN")
 
     _add_environment_arguments(parser)
     _add_training_arguments(parser)
@@ -108,17 +107,15 @@ def _add_training_arguments(parser):
 
 
 def _add_action_space_arguments(parser):
-    """Add action space growth arguments."""
-    parser.add_argument("--initial-bins", type=int, default=2)
-    parser.add_argument("--final-bins", type=int, default=9)
-    parser.add_argument(
-        "--unmasking-strategy",
-        type=str,
-        default="hybrid",
-        choices=["variance", "advantage", "hybrid"],
-    )
-    parser.add_argument("--growth-check-interval", type=int, default=50)
-    parser.add_argument("--min-episodes-before-growth", type=int, default=100)
+    """Add action space adaptation arguments."""
+    parser.add_argument("--initial-bins", type=int, default=5,
+                        help="Initial bins for wide coverage (phase 1)")
+    parser.add_argument("--final-bins", type=int, default=9,
+                        help="Maximum bins in discretization grid")
+    parser.add_argument("--min-episodes-phase2", type=int, default=50,
+                        help="Episodes before entering phase 2 (learning importance)")
+    parser.add_argument("--min-episodes-phase3", type=int, default=150,
+                        help="Episodes before entering phase 3 (pruning & refinement)")
 
 
 def _add_exploration_arguments(parser):
