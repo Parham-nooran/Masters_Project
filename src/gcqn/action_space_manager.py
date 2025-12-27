@@ -1,17 +1,20 @@
 import torch
+import numpy as np
 from collections import deque
 
 
 class GCQNActionSpaceManager:
     """
-    True coarse-to-fine action space manager.
-    Phase 1: Wide coverage with uniform coarse bins
-    Phase 2: Identify important regions through metrics
-    Phase 3: Prune low-value bins, refine high-value regions
-    Result: Fewer bins, but better positioned (adaptive resolution)
+    Q-value Guided Growth with Lazy Pruning action space manager.
+
+    Algorithm phases:
+    1. Uniform exploration: Build initial Q-estimates
+    2. Weighted selection: Focus on high-Q bins
+    3. Lazy pruning: Remove persistently low-value bins
     """
 
-    def __init__(self, action_spec, initial_bins, final_bins, device):
+    def __init__(self, action_spec, initial_bins, final_bins, device,
+                 confidence_threshold=50, temperature_decay=0.995):
         self.device = device
         self.action_min = torch.tensor(
             action_spec["low"], dtype=torch.float32, device=device
@@ -23,15 +26,22 @@ class GCQNActionSpaceManager:
         self.initial_bins = initial_bins
         self.final_bins = final_bins
 
+        self.confidence_threshold = confidence_threshold
+        self.temperature = 10.0
+        self.temperature_decay = temperature_decay
+        self.min_temperature = 0.5
+
         self.action_bins = self._create_full_action_grid()
-        self.active_masks = self._initialize_wide_coverage_masks()
+        self.active_masks = self._initialize_uniform_coverage()
+
+        self.metrics_tracker = QValueGuidedTracker(
+            self.action_dim, self.final_bins, device
+        )
+
         self.growth_history = []
         self.pruning_history = []
         self.current_phase = 1
-
-        self.metrics_tracker = BinImportanceTracker(
-            self.action_dim, self.final_bins, device
-        )
+        self.weighted_selection_enabled = False
 
     def _create_full_action_grid(self):
         """Create complete discretized grid across all dimensions."""
@@ -46,21 +56,21 @@ class GCQNActionSpaceManager:
             bins_per_dim.append(dim_bins)
         return torch.stack(bins_per_dim)
 
-    def _initialize_wide_coverage_masks(self):
-        """Initialize with wide coverage - uniform coarse bins."""
+    def _initialize_uniform_coverage(self):
+        """Initialize with uniform coverage across action space."""
         masks = torch.zeros(
             self.action_dim, self.final_bins, dtype=torch.bool, device=self.device
         )
 
-        coarse_indices = self._compute_uniform_coarse_indices()
+        uniform_indices = self._compute_uniform_indices()
         for dim in range(self.action_dim):
-            masks[dim, coarse_indices] = True
+            masks[dim, uniform_indices] = True
 
         return masks
 
-    def _compute_uniform_coarse_indices(self):
-        """Compute evenly-spaced indices for wide coverage."""
-        if self.initial_bins == self.final_bins:
+    def _compute_uniform_indices(self):
+        """Compute uniformly-spaced bin indices for initial coverage."""
+        if self.initial_bins >= self.final_bins:
             return list(range(self.final_bins))
 
         step = (self.final_bins - 1) / (self.initial_bins - 1)
@@ -86,7 +96,8 @@ class GCQNActionSpaceManager:
     def _get_active_indices_per_dimension(self):
         """Get list of active bin indices for each dimension."""
         return [
-            torch.where(self.active_masks[dim])[0] for dim in range(self.action_dim)
+            torch.where(self.active_masks[dim])[0]
+            for dim in range(self.action_dim)
         ]
 
     def _map_to_actual_indices(self, discrete_actions, active_indices_per_dim):
@@ -144,92 +155,134 @@ class GCQNActionSpaceManager:
         return padded
 
     def update_metrics(self, q_values, actions):
-        """Update metrics for adaptive pruning/refinement decisions."""
+        """Update tracking with new Q-values and actions."""
         self.metrics_tracker.update(q_values, actions, self.active_masks)
 
-    def check_and_adapt(self, episode, min_episodes_phase2, min_episodes_phase3):
-        """
-        Check if action space should be adapted.
-        Returns tuple: (adapted, phase_changed)
-        """
-        if episode < min_episodes_phase2:
-            return False, False
+    def check_and_switch_to_weighted_selection(self, episode):
+        """Check if should switch from uniform to weighted selection."""
+        if self.weighted_selection_enabled:
+            return False
 
-        if self.current_phase == 1 and episode >= min_episodes_phase2:
+        if not self.metrics_tracker.has_sufficient_data():
+            return False
+
+        if self.metrics_tracker.is_confident():
+            self.weighted_selection_enabled = True
             self.current_phase = 2
-            return False, True
+            return True
 
-        if self.current_phase == 2 and episode >= min_episodes_phase3:
-            self.current_phase = 3
-            adapted = self._perform_pruning_and_refinement(episode)
-            return adapted, True
+        return False
 
-        if self.current_phase == 3:
-            adapted = self._perform_selective_refinement(episode)
-            return adapted, False
-
-        return False, False
-
-    def _perform_pruning_and_refinement(self, episode):
+    def get_weighted_action_probabilities(self, q_values):
         """
-        Phase 3: Prune low-value bins and refine high-value regions.
-        This is the core of true coarse-to-fine.
+        Compute action selection probabilities weighted by Q-values.
+        Uses temperature-based softmax for smooth exploration-exploitation.
         """
-        if not self._has_sufficient_metrics():
-            return False
+        if not self.weighted_selection_enabled:
+            return None
 
-        metrics = self.metrics_tracker.compute_metrics()
-        importance = self._compute_bin_importance(metrics)
+        probabilities = []
 
-        bins_pruned = self._prune_low_importance_bins(importance, episode)
-        bins_refined = self._refine_high_importance_bins(importance, episode)
+        for dim in range(self.action_dim):
+            active_indices = torch.where(self.active_masks[dim])[0]
+            active_q = q_values[:, dim, active_indices]
 
-        return bins_pruned > 0 or bins_refined > 0
+            dim_probs = torch.softmax(active_q / self.temperature, dim=1)
+            probabilities.append(dim_probs)
 
-    def _perform_selective_refinement(self, episode):
+        return probabilities
+
+    def decay_temperature(self):
+        """Decay temperature for gradual shift from exploration to exploitation."""
+        self.temperature = max(
+            self.min_temperature,
+            self.temperature * self.temperature_decay
+        )
+
+    def check_and_adapt(self, episode):
         """
-        Ongoing refinement: Add detail to promising regions without pruning.
+        Check conditions and perform growth or pruning.
+
+        Returns: (did_change, change_type)
         """
-        if not self._has_sufficient_metrics():
-            return False
+        if episode < self.confidence_threshold:
+            return False, 'too_early'
 
-        metrics = self.metrics_tracker.compute_metrics()
-        importance = self._compute_bin_importance(metrics)
+        did_grow = False
+        did_prune = False
 
-        bins_refined = self._refine_high_importance_bins(importance, episode)
-        return bins_refined > 0
+        if episode % 50 == 0:
+            bins_grown = self._perform_growth(episode)
+            did_grow = bins_grown > 0
 
-    def _has_sufficient_metrics(self):
-        """Check if we have enough data for reliable decisions."""
-        return len(self.metrics_tracker.q_history) >= 20
+        if episode >= 150 and episode % 25 == 0:
+            bins_pruned = self._perform_pruning(episode)
+            did_prune = bins_pruned > 0
 
-    def _compute_bin_importance(self, metrics):
-        """
-        Compute importance score for each bin.
-        High importance = high Q-value + high visits + high variance
-        """
-        q_variance_norm = self._normalize_metric(metrics["q_variance"])
-        q_advantage_norm = self._normalize_metric(metrics["q_advantage"])
-        visit_norm = self._normalize_metric(metrics["visit_counts"])
+            if did_prune:
+                self.current_phase = 3
 
-        importance = 0.3 * q_variance_norm + 0.5 * q_advantage_norm + 0.2 * visit_norm
-        return importance
+        if did_grow:
+            return True, 'growth'
+        elif did_prune:
+            return True, 'pruning'
 
-    def _normalize_metric(self, metric):
-        """Normalize metric to [0, 1] range."""
-        min_val = metric.min()
-        max_val = metric.max()
-        if max_val - min_val < 1e-8:
-            return torch.zeros_like(metric)
-        return (metric - min_val) / (max_val - min_val)
+        return False, 'none'
 
-    def _prune_low_importance_bins(self, importance, episode):
-        """
-        Prune bins with low importance (deactivate them).
-        This is what makes it true coarse-to-fine: we REDUCE bins.
-        """
+    def _perform_growth(self, episode):
+        """Grow bins near high-Q regions."""
+        if not self.metrics_tracker.has_sufficient_data():
+            return 0
+
+        mean_q_values = self.metrics_tracker.get_mean_q_values()
+        bins_grown = 0
+
+        for dim in range(self.action_dim):
+            active_bins = torch.where(self.active_masks[dim])[0]
+
+            if len(active_bins) >= self.final_bins:
+                continue
+
+            active_q = mean_q_values[dim, active_bins]
+            top_k = max(1, len(active_bins) // 3)
+            _, top_indices = torch.topk(active_q, k=top_k)
+            top_bins = active_bins[top_indices]
+
+            for bin_idx in top_bins:
+                neighbors = self._get_growth_candidates(dim, bin_idx.item())
+
+                for neighbor_idx in neighbors:
+                    if not self.active_masks[dim, neighbor_idx]:
+                        self.active_masks[dim, neighbor_idx] = True
+                        bins_grown += 1
+
+        if bins_grown > 0:
+            self.growth_history.append({
+                'episode': episode,
+                'bins_grown': bins_grown
+            })
+
+        return bins_grown
+
+    def _get_growth_candidates(self, dim, bin_idx):
+        """Get neighboring bins that could be activated."""
+        candidates = []
+
+        if bin_idx > 0:
+            candidates.append(bin_idx - 1)
+        if bin_idx < self.final_bins - 1:
+            candidates.append(bin_idx + 1)
+
+        return candidates
+
+    def _perform_pruning(self, episode):
+        """Prune bins with persistently low Q-values and low visits."""
+        if not self.metrics_tracker.has_sufficient_data():
+            return 0
+
+        mean_q_values = self.metrics_tracker.get_mean_q_values()
+        recent_visits = self.metrics_tracker.get_recent_visit_counts()
         bins_pruned = 0
-        prune_threshold = 0.2
 
         for dim in range(self.action_dim):
             active_bins = torch.where(self.active_masks[dim])[0]
@@ -237,85 +290,60 @@ class GCQNActionSpaceManager:
             if len(active_bins) <= 2:
                 continue
 
-            for bin_idx in active_bins:
-                if importance[dim, bin_idx] < prune_threshold:
-                    if self._can_prune_bin(dim, bin_idx):
-                        self.active_masks[dim, bin_idx] = False
-                        bins_pruned += 1
+            active_q = mean_q_values[dim, active_bins]
+            active_visits = recent_visits[dim, active_bins]
+
+            q_threshold = torch.quantile(active_q, 0.25)
+            visit_threshold = 5
+
+            for i, bin_idx in enumerate(active_bins):
+                if (active_q[i] < q_threshold and
+                        active_visits[i] < visit_threshold and
+                        self._can_safely_prune(dim, bin_idx.item())):
+                    self.active_masks[dim, bin_idx] = False
+                    bins_pruned += 1
 
         if bins_pruned > 0:
             self.pruning_history.append({
-                "episode": episode,
-                "bins_pruned": bins_pruned,
-                "total_active": self.active_masks.sum().item()
+                'episode': episode,
+                'bins_pruned': bins_pruned
             })
 
         return bins_pruned
 
-    def _can_prune_bin(self, dim, bin_idx):
-        """
-        Check if bin can be safely pruned.
-        Don't prune if it would isolate important regions.
-        """
-        active_bins = torch.where(self.active_masks[dim])[0]
+    def _can_safely_prune(self, dim, bin_idx):
+        """Check if bin can be safely pruned without losing connectivity."""
+        active_bins = torch.where(self.active_masks[dim])[0].cpu().numpy()
 
-        temp_mask = self.active_masks[dim].clone()
-        temp_mask[bin_idx] = False
-        remaining_active = torch.where(temp_mask)[0]
-
-        if len(remaining_active) < 2:
+        if len(active_bins) <= 2:
             return False
 
-        gaps = remaining_active[1:] - remaining_active[:-1]
-        max_gap = gaps.max().item() if len(gaps) > 0 else 0
+        if bin_idx == active_bins[0] or bin_idx == active_bins[-1]:
+            return len(active_bins) > 3
 
-        return max_gap <= 3
+        left_neighbor = bin_idx - 1
+        right_neighbor = bin_idx + 1
 
-    def _refine_high_importance_bins(self, importance, episode):
-        """
-        Add neighboring bins to high-importance regions for finer control.
-        """
-        bins_refined = 0
-        refine_threshold = 0.7
+        has_active_neighbor = (
+                (left_neighbor >= 0 and self.active_masks[dim, left_neighbor]) or
+                (right_neighbor < self.final_bins and self.active_masks[dim, right_neighbor])
+        )
 
-        high_importance_bins = importance > refine_threshold
-
-        for dim in range(self.action_dim):
-            active_high_bins = high_importance_bins[dim] & self.active_masks[dim]
-            high_bin_indices = torch.where(active_high_bins)[0]
-
-            for bin_idx in high_bin_indices:
-                left_neighbor = bin_idx - 1
-                right_neighbor = bin_idx + 1
-
-                if left_neighbor >= 0 and not self.active_masks[dim, left_neighbor]:
-                    self.active_masks[dim, left_neighbor] = True
-                    bins_refined += 1
-
-                if (right_neighbor < self.final_bins and
-                        not self.active_masks[dim, right_neighbor]):
-                    self.active_masks[dim, right_neighbor] = True
-                    bins_refined += 1
-
-        if bins_refined > 0:
-            self.growth_history.append({
-                "episode": episode,
-                "bins_refined": bins_refined,
-                "total_active": self.active_masks.sum().item()
-            })
-
-        return bins_refined
+        return has_active_neighbor
 
     def get_growth_info(self):
-        """Get information about current adaptation state."""
+        """Get information about current growth state."""
         return {
             "current_phase": self.current_phase,
+            "weighted_selection": self.weighted_selection_enabled,
+            "temperature": self.temperature,
             "total_active_bins": self.active_masks.sum().item(),
             "total_possible_bins": self.action_dim * self.final_bins,
             "active_per_dimension": [
-                self.active_masks[d].sum().item() for d in range(self.action_dim)
+                self.active_masks[d].sum().item()
+                for d in range(self.action_dim)
             ],
-            "refinement_events": len(self.growth_history),
+            "growth_events": len(self.growth_history),
             "pruning_events": len(self.pruning_history)
         }
 
@@ -323,31 +351,50 @@ class GCQNActionSpaceManager:
         """Generate visual representation of active bins per dimension."""
         visualization = []
 
+        mean_q = self.metrics_tracker.get_mean_q_values() if self.metrics_tracker.has_sufficient_data() else None
+
         for dim in range(self.action_dim):
             active_indices = torch.where(self.active_masks[dim])[0].cpu().numpy()
-            dim_viz = self._create_dimension_visualization(dim, active_indices)
+            dim_viz = self._create_dimension_visualization(dim, active_indices, mean_q)
             visualization.append(dim_viz)
 
             if logger:
                 logger.info(f"  Dim {dim}: {dim_viz['ascii']}")
-                logger.info(
-                    f"         Active: {dim_viz['active_bins']}/{self.final_bins} | "
-                    f"Range: [{dim_viz['min_val']:.2f}, {dim_viz['max_val']:.2f}]"
-                )
+                logger.info(f"         Active: {dim_viz['active_bins']}/{self.final_bins} "
+                            f"| Range: [{dim_viz['min_val']:.2f}, {dim_viz['max_val']:.2f}]")
+                if mean_q is not None:
+                    logger.info(f"         Avg Q: {dim_viz['avg_q']:.2f}")
 
         return visualization
 
-    def _create_dimension_visualization(self, dim, active_indices):
+    def _create_dimension_visualization(self, dim, active_indices, mean_q):
         """Create visualization for single dimension."""
         ascii_repr = []
 
         for bin_idx in range(self.final_bins):
             if bin_idx in active_indices:
-                ascii_repr.append("█")
+                if mean_q is not None:
+                    q_val = mean_q[dim, bin_idx].item()
+                    active_q = mean_q[dim, active_indices]
+                    q_mean = active_q.mean().item()
+
+                    if q_val > q_mean + active_q.std().item():
+                        ascii_repr.append("█")
+                    elif q_val > q_mean:
+                        ascii_repr.append("▓")
+                    else:
+                        ascii_repr.append("▒")
+                else:
+                    ascii_repr.append("█")
             else:
                 ascii_repr.append("░")
 
         active_bins_values = self.action_bins[dim, active_indices].cpu().numpy()
+
+        avg_q = 0.0
+        if mean_q is not None:
+            active_q = mean_q[dim, active_indices]
+            avg_q = active_q.mean().item()
 
         return {
             "dimension": dim,
@@ -355,92 +402,40 @@ class GCQNActionSpaceManager:
             "active_bins": len(active_indices),
             "min_val": active_bins_values.min() if len(active_bins_values) > 0 else 0,
             "max_val": active_bins_values.max() if len(active_bins_values) > 0 else 0,
-            "active_indices": active_indices.tolist()
-        }
-
-    def get_importance_visualization(self, logger=None):
-        """Visualize bin importance scores."""
-        if not self._has_sufficient_metrics():
-            return None
-
-        metrics = self.metrics_tracker.compute_metrics()
-        importance = self._compute_bin_importance(metrics)
-
-        visualization = []
-
-        for dim in range(self.action_dim):
-            dim_viz = self._create_importance_visualization(dim, importance[dim])
-            visualization.append(dim_viz)
-
-            if logger:
-                logger.info(f"  Dim {dim}: {dim_viz['ascii']}")
-                logger.info(
-                    f"         Avg importance: {dim_viz['avg_importance']:.3f} | "
-                    f"High-value bins: {dim_viz['high_value_count']}"
-                )
-
-        return visualization
-
-    def _create_importance_visualization(self, dim, importance_scores):
-        """Create importance visualization for single dimension."""
-        ascii_repr = []
-        high_value_threshold = 0.7
-        high_value_count = 0
-
-        for bin_idx in range(self.final_bins):
-            if self.active_masks[dim, bin_idx]:
-                score = importance_scores[bin_idx].item()
-                if score > high_value_threshold:
-                    ascii_repr.append("▓")
-                    high_value_count += 1
-                elif score > 0.3:
-                    ascii_repr.append("█")
-                else:
-                    ascii_repr.append("▒")
-            else:
-                ascii_repr.append("░")
-
-        active_importance = importance_scores[self.active_masks[dim]]
-        avg_importance = active_importance.mean().item() if len(active_importance) > 0 else 0
-
-        return {
-            "dimension": dim,
-            "ascii": "".join(ascii_repr),
-            "avg_importance": avg_importance,
-            "high_value_count": high_value_count
+            "active_indices": active_indices.tolist(),
+            "avg_q": avg_q
         }
 
     def log_detailed_state(self, logger, episode):
         """Log comprehensive state information."""
         logger.info("=" * 80)
-        logger.info(f"TRUE COARSE-TO-FINE STATE at Episode {episode}")
+        logger.info(f"GCQN ACTION SPACE STATE at Episode {episode}")
         logger.info("=" * 80)
 
+        phase_names = {
+            1: "Uniform Exploration",
+            2: "Weighted Selection",
+            3: "Weighted + Pruning"
+        }
+        logger.info(f"Phase {self.current_phase}: {phase_names[self.current_phase]}")
+        logger.info(f"Temperature: {self.temperature:.3f}")
+        logger.info("")
+
         growth_info = self.get_growth_info()
-        phase_names = {1: "Wide Coverage", 2: "Learning Importance", 3: "Pruning & Refinement"}
-        logger.info(f"Current Phase: {growth_info['current_phase']} - {phase_names[growth_info['current_phase']]}")
-        logger.info(
-            f"Active bins: {growth_info['total_active_bins']}/{growth_info['total_possible_bins']} "
-            f"({100 * growth_info['total_active_bins'] / growth_info['total_possible_bins']:.1f}%)"
-        )
-        logger.info(f"Refinement events: {growth_info['refinement_events']}")
+        logger.info(f"Active bins: {growth_info['total_active_bins']}/{growth_info['total_possible_bins']} "
+                    f"({100 * growth_info['total_active_bins'] / growth_info['total_possible_bins']:.1f}%)")
+        logger.info(f"Growth events: {growth_info['growth_events']}")
         logger.info(f"Pruning events: {growth_info['pruning_events']}")
         logger.info("")
 
         logger.info("Active Bins per Dimension:")
-        logger.info("Legend: █ = Active  ░ = Inactive  ▓ = High Importance  ▒ = Low Importance")
+        logger.info("Legend: █ = High Q  ▓ = Medium Q  ▒ = Low Q  ░ = Inactive")
         self.get_visual_representation(logger)
-        logger.info("")
-
-        if self._has_sufficient_metrics():
-            logger.info("Bin Importance Scores:")
-            self.get_importance_visualization(logger)
-
         logger.info("=" * 80)
 
 
-class BinImportanceTracker:
-    """Tracks metrics for determining bin importance."""
+class QValueGuidedTracker:
+    """Tracks Q-values and visits for Q-value guided adaptation."""
 
     def __init__(self, action_dim, num_bins, device, history_size=100):
         self.action_dim = action_dim
@@ -452,20 +447,23 @@ class BinImportanceTracker:
         self.visit_counts = torch.zeros(
             action_dim, num_bins, device=device, dtype=torch.float32
         )
-        self.q_value_sums = torch.zeros(
+        self.cumulative_q = torch.zeros(
             action_dim, num_bins, device=device, dtype=torch.float32
         )
+        self.recent_visit_window = deque(maxlen=50)
 
     def update(self, q_values, actions, active_masks):
         """Update tracking with new Q-values and actions."""
         self.q_history.append(q_values.detach())
         self._update_visit_counts(actions, active_masks)
-        self._update_q_value_sums(q_values, actions, active_masks)
+        self._update_cumulative_q(q_values, actions, active_masks)
 
     def _update_visit_counts(self, actions, active_masks):
         """Update count of visits to each bin."""
         if len(actions.shape) == 1:
             actions = actions.unsqueeze(0)
+
+        visit_snapshot = torch.zeros_like(self.visit_counts)
 
         for dim in range(self.action_dim):
             active_indices = torch.where(active_masks[dim])[0]
@@ -473,71 +471,58 @@ class BinImportanceTracker:
                 if 0 <= action_idx < len(active_indices):
                     actual_bin = active_indices[action_idx]
                     self.visit_counts[dim, actual_bin] += 1
+                    visit_snapshot[dim, actual_bin] += 1
 
-    def _update_q_value_sums(self, q_values, actions, active_masks):
-        """Update sum of Q-values for each bin."""
+        self.recent_visit_window.append(visit_snapshot)
+
+    def _update_cumulative_q(self, q_values, actions, active_masks):
+        """Update cumulative Q-values for visited bins."""
         if len(actions.shape) == 1:
             actions = actions.unsqueeze(0)
 
         batch_size = q_values.shape[0]
 
-        for dim in range(self.action_dim):
-            active_indices = torch.where(active_masks[dim])[0]
-            for b in range(batch_size):
+        for b in range(batch_size):
+            for dim in range(self.action_dim):
+                active_indices = torch.where(active_masks[dim])[0]
                 action_idx = actions[b, dim]
+
                 if 0 <= action_idx < len(active_indices):
                     actual_bin = active_indices[action_idx]
-                    if actual_bin < q_values.shape[2]:
-                        self.q_value_sums[dim, actual_bin] += q_values[b, dim, actual_bin]
+                    self.cumulative_q[dim, actual_bin] += q_values[b, dim, actual_bin]
 
-    def compute_metrics(self):
-        """Compute metrics for adaptation decisions."""
-        if len(self.q_history) < 10:
-            return self._default_metrics()
+    def has_sufficient_data(self):
+        """Check if enough data has been collected."""
+        return len(self.q_history) >= 20 and self.visit_counts.sum() > 50
 
-        stacked_q = torch.stack(list(self.q_history), dim=0)
+    def is_confident(self):
+        """Check if Q-value estimates are confident enough for weighted selection."""
+        if len(self.q_history) < 30:
+            return False
 
-        return {
-            "q_variance": self._compute_variance(stacked_q),
-            "q_advantage": self._compute_advantage(stacked_q),
-            "visit_counts": self.visit_counts,
-            "mean_q_values": self._compute_mean_q_values()
-        }
+        recent_q = torch.stack(list(self.q_history)[-30:], dim=0)
+        q_std = recent_q.std(dim=0).mean()
 
-    def _compute_variance(self, stacked_q):
-        """Compute variance of Q-values over history."""
-        return stacked_q.var(dim=0).mean(dim=0)
+        return q_std < 15.0
 
-    def _compute_advantage(self, stacked_q):
-        """Compute advantage of each bin relative to mean."""
-        recent_q = stacked_q[-20:].mean(dim=0)
-
-        advantages = torch.zeros(self.action_dim, self.num_bins, device=self.device)
-
-        for dim in range(self.action_dim):
-            dim_q_mean = recent_q[:, dim, :].mean()
-            advantages[dim] = recent_q[:, dim, :].mean(dim=0) - dim_q_mean
-
-        return advantages
-
-    def _compute_mean_q_values(self):
-        """Compute mean Q-values per bin."""
-        mean_q = torch.zeros(self.action_dim, self.num_bins, device=self.device)
+    def get_mean_q_values(self):
+        """Compute mean Q-value per bin."""
+        mean_q = torch.zeros_like(self.cumulative_q)
 
         for dim in range(self.action_dim):
             for bin_idx in range(self.num_bins):
                 if self.visit_counts[dim, bin_idx] > 0:
                     mean_q[dim, bin_idx] = (
-                            self.q_value_sums[dim, bin_idx] / self.visit_counts[dim, bin_idx]
+                            self.cumulative_q[dim, bin_idx] /
+                            self.visit_counts[dim, bin_idx]
                     )
 
         return mean_q
 
-    def _default_metrics(self):
-        """Return default metrics when insufficient history."""
-        return {
-            "q_variance": torch.zeros(self.action_dim, self.num_bins, device=self.device),
-            "q_advantage": torch.zeros(self.action_dim, self.num_bins, device=self.device),
-            "visit_counts": self.visit_counts,
-            "mean_q_values": torch.zeros(self.action_dim, self.num_bins, device=self.device)
-        }
+    def get_recent_visit_counts(self):
+        """Get visit counts from recent window."""
+        if len(self.recent_visit_window) == 0:
+            return torch.zeros_like(self.visit_counts)
+
+        recent_visits = torch.stack(list(self.recent_visit_window), dim=0)
+        return recent_visits.sum(dim=0)

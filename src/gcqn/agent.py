@@ -9,26 +9,21 @@ from src.common.encoder import VisionEncoder
 from src.gqn.network import DualDecoupledQNetwork
 
 
-def _compute_observation_dimension(config, obs_shape):
-    """Determine observation dimension for network input."""
-    if len(obs_shape) == 1:
-        return obs_shape[0]
-    if hasattr(config, "layer_size_bottleneck"):
-        return config.layer_size_bottleneck
-    return 50
-
-
 class GCQNAgent:
     """
-    True Coarse-to-Fine Agent (GCQN).
-    Combines wide coverage → importance learning → selective pruning & refinement.
+    Q-value Guided Growth with Lazy Pruning agent.
+
+    Features:
+    - Weighted action selection based on Q-values
+    - Growth near high-Q bins
+    - Lazy pruning of low-value bins
     """
 
     def __init__(self, config, obs_shape, action_spec):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.obs_dim = _compute_observation_dimension(config, obs_shape)
+        self.obs_dim = self._compute_observation_dimension(config, obs_shape)
         self.encoder = self._create_encoder_if_needed(config, obs_shape)
         self.action_space_manager = self._create_action_space_manager(
             config, action_spec
@@ -41,6 +36,14 @@ class GCQNAgent:
         self.epsilon = config.epsilon
         self.update_counter = 0
         self.last_obs = None
+
+    def _compute_observation_dimension(self, config, obs_shape):
+        """Determine observation dimension for network input."""
+        if len(obs_shape) == 1:
+            return obs_shape[0]
+        if hasattr(config, "layer_size_bottleneck"):
+            return config.layer_size_bottleneck
+        return 50
 
     def _create_encoder_if_needed(self, config, obs_shape):
         """Create vision encoder for pixel-based observations."""
@@ -55,9 +58,14 @@ class GCQNAgent:
         return optim.Adam(self.encoder.parameters(), lr=config.learning_rate)
 
     def _create_action_space_manager(self, config, action_spec):
-        """Create true coarse-to-fine action space manager."""
+        """Create Q-value guided action space manager."""
         return GCQNActionSpaceManager(
-            action_spec, config.initial_bins, config.final_bins, self.device
+            action_spec,
+            config.initial_bins,
+            config.final_bins,
+            self.device,
+            confidence_threshold=config.confidence_threshold,
+            temperature_decay=config.temperature_decay
         )
 
     def _create_networks(self, config):
@@ -102,14 +110,25 @@ class GCQNAgent:
         self.last_obs = obs
 
     def select_action(self, obs, epsilon=None):
-        """Select action using epsilon-greedy with active bins."""
+        """
+        Select action using weighted or uniform epsilon-greedy.
+
+        Switches from uniform to weighted selection when Q-values are confident.
+        """
         epsilon = epsilon if epsilon is not None else self.epsilon
 
         with torch.no_grad():
             obs_encoded = self._encode_observation(obs)
             q_combined = self._compute_combined_q_values(obs_encoded)
-            active_q = self.action_space_manager.get_active_q_values(q_combined)
-            discrete_action = self._epsilon_greedy_selection(active_q, epsilon)
+
+            if self.action_space_manager.weighted_selection_enabled:
+                discrete_action = self._weighted_epsilon_greedy_selection(
+                    q_combined, epsilon
+                )
+            else:
+                discrete_action = self._uniform_epsilon_greedy_selection(
+                    q_combined, epsilon
+                )
 
             self.action_space_manager.update_metrics(q_combined, discrete_action)
 
@@ -129,15 +148,40 @@ class GCQNAgent:
         q1, q2 = self.q_network(obs_encoded)
         return torch.max(q1, q2)
 
-    def _epsilon_greedy_selection(self, q_values, epsilon):
-        """Perform epsilon-greedy action selection."""
-        batch_size, action_dim, num_active_bins = q_values.shape
+    def _weighted_epsilon_greedy_selection(self, q_values, epsilon):
+        """
+        Select actions using Q-value weighted probabilities with epsilon exploration.
+        """
+        batch_size, action_dim = q_values.shape[0], self.action_space_manager.action_dim
+
+        action_probs = self.action_space_manager.get_weighted_action_probabilities(q_values)
+
+        discrete_actions = torch.zeros(batch_size, action_dim, dtype=torch.long, device=self.device)
+
+        for dim in range(action_dim):
+            if torch.rand(1).item() < epsilon:
+                num_active = action_probs[dim].shape[1]
+                discrete_actions[:, dim] = torch.randint(
+                    0, num_active, (batch_size,), device=self.device
+                )
+            else:
+                discrete_actions[:, dim] = torch.multinomial(
+                    action_probs[dim], num_samples=1
+                ).squeeze(1)
+
+        return discrete_actions
+
+    def _uniform_epsilon_greedy_selection(self, q_values, epsilon):
+        """Select actions using standard epsilon-greedy."""
+        active_q = self.action_space_manager.get_active_q_values(q_values)
+
+        batch_size, action_dim, num_active_bins = active_q.shape
 
         random_mask = torch.rand(batch_size, action_dim, device=self.device) < epsilon
         random_actions = torch.randint(
             0, num_active_bins, (batch_size, action_dim), device=self.device
         )
-        greedy_actions = q_values.argmax(dim=2)
+        greedy_actions = active_q.argmax(dim=2)
 
         return torch.where(random_mask, random_actions, greedy_actions)
 
@@ -335,17 +379,23 @@ class GCQNAgent:
         if self.update_counter % self.config.target_update_period == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
-    def check_and_adapt(self, episode, episode_return):
-        """
-        Check conditions and adapt action space if appropriate.
-        Returns tuple: (adapted, phase_changed)
-        """
-        adapted, phase_changed = self.action_space_manager.check_and_adapt(
-            episode,
-            self.config.min_episodes_phase2,
-            self.config.min_episodes_phase3
-        )
-        return adapted, phase_changed
+    def check_and_adapt(self, episode):
+        """Check conditions and adapt action space."""
+        switched = self.action_space_manager.check_and_switch_to_weighted_selection(episode)
+
+        if switched:
+            return True, 'weighted_selection_enabled'
+
+        did_change, change_type = self.action_space_manager.check_and_adapt(episode)
+
+        if did_change:
+            return True, change_type
+
+        return False, 'none'
+
+    def decay_temperature(self):
+        """Decay temperature for weighted selection."""
+        self.action_space_manager.decay_temperature()
 
     def update_epsilon(self, decay_rate=None, min_epsilon=None):
         """Update exploration rate with decay."""
@@ -364,7 +414,8 @@ class GCQNAgent:
             "action_space_masks": self.action_space_manager.active_masks,
             "growth_history": self.action_space_manager.growth_history,
             "pruning_history": self.action_space_manager.pruning_history,
-            "current_phase": self.action_space_manager.current_phase,
+            "temperature": self.action_space_manager.temperature,
+            "weighted_selection_enabled": self.action_space_manager.weighted_selection_enabled,
         }
 
         if self.encoder:
@@ -383,7 +434,10 @@ class GCQNAgent:
         self.action_space_manager.active_masks = checkpoint["action_space_masks"]
         self.action_space_manager.growth_history = checkpoint["growth_history"]
         self.action_space_manager.pruning_history = checkpoint.get("pruning_history", [])
-        self.action_space_manager.current_phase = checkpoint.get("current_phase", 1)
+        self.action_space_manager.temperature = checkpoint.get("temperature", 10.0)
+        self.action_space_manager.weighted_selection_enabled = checkpoint.get(
+            "weighted_selection_enabled", False
+        )
 
         if "encoder" in checkpoint and self.encoder:
             self.encoder.load_state_dict(checkpoint["encoder"])

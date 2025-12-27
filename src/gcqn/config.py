@@ -4,11 +4,11 @@ from dataclasses import dataclass
 
 @dataclass
 class GCQNConfig:
-    """Configuration for True Coarse-to-Fine GCQN with phase-based parameters."""
+    """Configuration for Q-value Guided Growth with Lazy Pruning."""
 
     env_type: str = "dmcontrol"
     task: str = "walker_walk"
-    seed: int = 0
+    seed: int = 42
     num_episodes: int = 1000
     max_steps_per_episode: int = 1000
 
@@ -24,8 +24,8 @@ class GCQNConfig:
 
     initial_bins: int = 5
     final_bins: int = 9
-    min_episodes_phase2: int = 50
-    min_episodes_phase3: int = 150
+    confidence_threshold: int = 50
+    temperature_decay: float = 0.995
 
     epsilon: float = 0.1
     epsilon_decay: float = 0.995
@@ -42,10 +42,9 @@ class GCQNConfig:
     num_layers: int = 2
 
     checkpoint_interval: int = 500
-    metrics_save_interval: int = 500
+    metrics_save_interval: int = 100
     log_interval: int = 5
-    detailed_log_interval: int = 50
-    eval_episodes: int = 10
+    detailed_log_interval: int = 25
 
     action_penalty_coeff: float = 0.0
 
@@ -53,7 +52,7 @@ class GCQNConfig:
     load_metrics: str = None
 
 
-def create_gcqn_config_from_args(args):
+def create_config_from_args(args):
     """Create config from command line arguments."""
     config = GCQNConfig()
 
@@ -64,9 +63,11 @@ def create_gcqn_config_from_args(args):
     return config
 
 
-def parse_gcqn_args():
-    """Parse command line arguments for GCQN training."""
-    parser = argparse.ArgumentParser(description="Train True Coarse-to-Fine GCQN")
+def parse_args():
+    """Parse command line arguments for training configuration."""
+    parser = argparse.ArgumentParser(
+        description="Train GCQN Agent"
+    )
 
     _add_environment_arguments(parser)
     _add_training_arguments(parser)
@@ -90,7 +91,7 @@ def _add_environment_arguments(parser):
         choices=["dmcontrol", "metaworld", "ogbench"],
     )
     parser.add_argument("--task", type=str, default="walker_walk")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-episodes", type=int, default=1000)
     parser.add_argument("--max-steps-per-episode", type=int, default=1000)
     parser.add_argument("--use-pixels", action="store_true")
@@ -108,14 +109,20 @@ def _add_training_arguments(parser):
 
 def _add_action_space_arguments(parser):
     """Add action space adaptation arguments."""
-    parser.add_argument("--initial-bins", type=int, default=5,
-                        help="Initial bins for wide coverage (phase 1)")
-    parser.add_argument("--final-bins", type=int, default=9,
-                        help="Maximum bins in discretization grid")
-    parser.add_argument("--min-episodes-phase2", type=int, default=50,
-                        help="Episodes before entering phase 2 (learning importance)")
-    parser.add_argument("--min-episodes-phase3", type=int, default=150,
-                        help="Episodes before entering phase 3 (pruning & refinement)")
+    parser.add_argument("--initial-bins", type=int, default=5)
+    parser.add_argument("--final-bins", type=int, default=9)
+    parser.add_argument(
+        "--confidence-threshold",
+        type=int,
+        default=50,
+        help="Episodes before enabling weighted selection"
+    )
+    parser.add_argument(
+        "--temperature-decay",
+        type=float,
+        default=0.995,
+        help="Temperature decay rate for softmax selection"
+    )
 
 
 def _add_exploration_arguments(parser):
@@ -150,8 +157,7 @@ def _add_network_arguments(parser):
 def _add_logging_arguments(parser):
     """Add logging and evaluation arguments."""
     parser.add_argument("--log-interval", type=int, default=5)
-    parser.add_argument("--detailed-log-interval", type=int, default=50)
-    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--detailed-log-interval", type=int, default=25)
     parser.add_argument("--metrics-save-interval", type=int, default=100)
 
 
